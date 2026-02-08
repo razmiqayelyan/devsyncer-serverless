@@ -1,0 +1,17 @@
+{
+    "ref": "refs/heads/main",
+    "head_commit": {
+      "id": "c4d5e6f7g8h9",
+      "message": "fix: updated the payment gateway retry logic to prevent timeout errors during high traffic",
+      "timestamp": "2024-02-07T14:00:00-05:00",
+      "url": "https://github.com/razo/devsyncer/commit/c4d5e6f7g8h9",
+      "author": {
+        "name": "Razo",
+        "email": "razo@example.com"
+      }
+    },
+    "pusher": {
+      "name": "Razo",
+      "email": "razo@example.com"
+    }
+  }
