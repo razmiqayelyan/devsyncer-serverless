@@ -6,10 +6,13 @@ class AIClient:
     def __init__(self):
         self.api_key = os.environ.get('OPENAI_KEY')
         if not self.api_key:
-            raise ValueError("Missing OPENAI_KEY")
+            # We don't raise error here, we handle it in summarize to avoid crash on init
+            print("Warning: OPENAI_KEY is missing")
 
     def summarize(self, text):
-        """Sends text to OpenAI"""
+        if not self.api_key:
+            return f"Summary unavailable (Missing API Key). Original: {text}"
+
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
             "Content-Type": "application/json",
