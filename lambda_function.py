@@ -1,118 +1,163 @@
 import json
 import os
 import urllib.request
+import urllib.error
 import base64
+import logging
 
-# --- CONFIGURATION (Loaded from AWS Environment Variables) ---
-JIRA_DOMAIN = os.environ.get('JIRA_DOMAIN')       # e.g., your-domain.atlassian.net
-JIRA_USER = os.environ.get('JIRA_USER')           # Your email
-JIRA_TOKEN = os.environ.get('JIRA_TOKEN')         # Your Atlassian API Token
-OPENAI_KEY = os.environ.get('OPENAI_KEY')         # Your OpenAI API Key
-JIRA_PROJECT_KEY = os.environ.get('JIRA_PROJECT_KEY', 'KAN') # Your Project Key (e.g., KAN, DS)
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-def call_openai(commit_msg):
+def get_env_variable(name):
+    """Helper to ensure all keys exist before we start."""
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"CRITICAL ERROR: Missing Environment Variable: {name}")
+    return value
+
+def safe_request(url, method, headers, data=None):
     """
-    Sends the commit message to OpenAI to get a non-technical summary.
-    Uses urllib to avoid external dependencies like 'requests' in AWS Lambda.
+    Robust HTTP request handler with timeout and error reading.
     """
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_KEY}"
-    }
-    data = {
-        "model": "gpt-3.5-turbo",
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant for a project manager."},
-            {"role": "user", "content": f"Summarize this technical commit message into one simple sentence for a non-technical manager: {commit_msg}"}
-        ],
-        "max_tokens": 60
-    }
-    
-    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
     try:
-        with urllib.request.urlopen(req) as response:
-            result = json.loads(response.read().decode())
-            return result['choices'][0]['message']['content']
-    except Exception as e:
-        print(f"OpenAI Error: {e}")
-        return "Automatic summary unavailable."
-
-def create_jira_ticket(summary, author):
-    """
-    Creates a Jira ticket using the Atlassian Cloud REST API.
-    """
-    url = f"https://{JIRA_DOMAIN}/rest/api/3/issue"
-    
-    # Create Basic Auth Header (Email:Token encoded in Base64)
-    auth_str = f"{JIRA_USER}:{JIRA_TOKEN}"
-    b64_auth = base64.b64encode(auth_str.encode()).decode()
-    
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Basic {b64_auth}"
-    }
-    
-    payload = {
-        "fields": {
-            "project": {"key": JIRA_PROJECT_KEY},
-            "summary": f"DevSyncer: Review Code by {author}",
-            "description": {
-                "type": "doc",
-                "version": 1,
-                "content": [{
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": f"AI Analysis: {summary}"}]
-                }]
-            },
-            "issuetype": {"name": "Task"} # Ensure 'Task' is a valid type in your Jira
-        }
-    }
-
-    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
-    try:
-        with urllib.request.urlopen(req) as response:
+        if data:
+            data = json.dumps(data).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        
+        # 10-second timeout to prevent hanging
+        with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode())
+            
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        logger.error(f"HTTP Error {e.code} from {url}: {error_body}")
+        return {"error": True, "status": e.code, "message": error_body}
     except Exception as e:
-        print(f"Jira Error: {e}")
-        return None
+        logger.error(f"Network Error: {str(e)}")
+        return {"error": True, "message": str(e)}
 
 def lambda_handler(event, context):
-    """
-    Main entry point for AWS Lambda.
-    """
-    print("Received event:", event)
+    logger.info("🚀 DevSyncer started processing...")
     
     try:
-        # 1. Parse the Body (API Gateway can send body as a string or dict)
+        # --- 1. CONFIGURATION CHECK ---
+        # We strip 'https://' and '/' to prevent user configuration errors
+        domain_raw = get_env_variable('JIRA_DOMAIN')
+        JIRA_DOMAIN = domain_raw.replace('https://', '').replace('http://', '').strip('/')
+        
+        JIRA_USER = get_env_variable('JIRA_USER')
+        JIRA_TOKEN = get_env_variable('JIRA_TOKEN')
+        OPENAI_KEY = get_env_variable('OPENAI_KEY')
+        JIRA_PROJECT_KEY = os.environ.get('JIRA_PROJECT_KEY', 'KAN')
+
+        # --- 2. PARSE INPUT ---
         body = event.get('body', '{}')
         if isinstance(body, str):
-            payload = json.loads(body)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid JSON body'})}
         else:
             payload = body
-            
-        # 2. Extract Data from GitHub Webhook Payload
-        # Note: 'head_commit' is standard for 'push' events
-        commit_msg = payload.get('head_commit', {}).get('message', 'No message provided')
-        author = payload.get('pusher', {}).get('name', 'Unknown Dev')
-        
-        print(f"Processing commit: '{commit_msg}' by {author}")
-        
-        # 3. Generate AI Summary
-        summary = call_openai(commit_msg)
-        
-        # 4. Create Jira Ticket
-        ticket = create_jira_ticket(summary, author)
-        
-        if ticket:
-            return {
-                'statusCode': 200,
-                'body': json.dumps({'message': 'Success', 'ticket_key': ticket['key'], 'ticket_url': f"https://{JIRA_DOMAIN}/browse/{ticket['key']}"})
-            }
-        else:
-             return {'statusCode': 500, 'body': json.dumps({'message': 'Failed to create Jira ticket'})}
 
+        # --- 3. HANDLE GITHUB "PING" EVENT ---
+        if 'zen' in payload:
+            logger.info("Received GitHub Ping event.")
+            return {'statusCode': 200, 'body': json.dumps({'message': 'Ping received. Webhook is active!'})}
+
+        # --- 4. EXTRACT DATA ---
+        head_commit = payload.get('head_commit')
+        if not head_commit:
+            logger.warning("No head_commit found. Ignoring non-push event.")
+            return {'statusCode': 200, 'body': json.dumps({'message': 'Ignored non-push event'})}
+
+        commit_msg = head_commit.get('message', 'No message')
+        author = payload.get('pusher', {}).get('name', 'Unknown')
+        commit_url = head_commit.get('url', 'No URL')
+
+        logger.info(f"Processing commit by {author}: {commit_msg}")
+
+        # --- 5. CALL OPENAI ---
+        openai_url = "https://api.openai.com/v1/chat/completions"
+        openai_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_KEY}"
+        }
+        # Using gpt-4o-mini if available (cheaper/faster), falling back to 3.5 is fine too
+        openai_payload = {
+            "model": "gpt-3.5-turbo",
+            "messages": [
+                {"role": "system", "content": "You are a concise technical writer."},
+                {"role": "user", "content": f"Summarize this git commit in 1 sentence for a manager: {commit_msg}"}
+            ],
+            "max_tokens": 100
+        }
+
+        ai_response = safe_request(openai_url, "POST", openai_headers, openai_payload)
+        
+        if ai_response.get("error"):
+            summary = f"Automatic summary failed. Original message: {commit_msg}"
+        else:
+            summary = ai_response['choices'][0]['message']['content']
+
+        # --- 6. CREATE JIRA TICKET ---
+        jira_url = f"https://{JIRA_DOMAIN}/rest/api/3/issue"
+        auth_str = f"{JIRA_USER}:{JIRA_TOKEN}"
+        b64_auth = base64.b64encode(auth_str.encode()).decode()
+        
+        jira_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {b64_auth}"
+        }
+        
+        # Professional Jira ADF Formatting (Separate Paragraphs)
+        jira_payload = {
+            "fields": {
+                "project": {"key": JIRA_PROJECT_KEY},
+                "summary": f"DevSyncer: {summary[:60]}...", 
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": f"Author: {author}", "marks": [{"type": "strong"}]}]
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": f"AI Analysis: {summary}"}]
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": f"Commit Link: {commit_url}"}]
+                        }
+                    ]
+                },
+                "issuetype": {"name": "Task"} 
+            }
+        }
+
+        jira_response = safe_request(jira_url, "POST", jira_headers, jira_payload)
+
+        if jira_response.get("error"):
+            logger.error(f"Jira Failed: {jira_response}")
+            return {'statusCode': 500, 'body': json.dumps({'error': 'Jira creation failed', 'details': jira_response})}
+
+        logger.info(f"Ticket Created: {jira_response.get('key')}")
+        return {
+            'statusCode': 200, 
+            'body': json.dumps({
+                'message': 'Success', 
+                'ticket': jira_response.get('key'),
+                'link': f"https://{JIRA_DOMAIN}/browse/{jira_response.get('key')}"
+            })
+        }
+
+    except ValueError as ve:
+        return {'statusCode': 500, 'body': json.dumps({'error': 'Configuration Error', 'details': str(ve)})}
     except Exception as e:
-        print(f"Critical Error: {str(e)}")
-        return {'statusCode': 400, 'body': json.dumps({'error': str(e)})}
+        logger.error(f"Unhandled Error: {e}")
+        return {'statusCode': 500, 'body': json.dumps({'error': 'Internal Server Error', 'details': str(e)})}
